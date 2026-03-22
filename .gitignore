@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+trade_log.csv
+data/gfex_*.csv
