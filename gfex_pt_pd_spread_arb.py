@@ -135,6 +135,59 @@ def calc_divergence(gfex_spread: pd.Series, lme_spread_cny: float) -> pd.Series:
     return gfex_spread - lme_spread_cny
 
 
+def calc_hurst(series: pd.Series) -> float:
+    """
+    计算 Hurst 指数（方差法）。
+
+    原理：对序列在不同时间跨度 lag 下计算标准差，
+    若标准差随 lag 增大的速度（斜率）> 0.5，说明有趋势记忆；
+    < 0.5 说明有均值回归倾向。
+
+    公式：std(lag) ~ lag^H  →  H = slope of log(std) vs log(lag)
+
+    返回值：
+      H < 0.45 → 均值回归（震荡）
+      H > 0.55 → 趋势持续
+      0.45~0.55 → 随机游走（不确定）
+    """
+    ts = series.dropna().values
+    if len(ts) < 30:
+        return 0.5   # 数据不足，返回中性值
+
+    lags = range(2, min(20, len(ts) // 3))
+    tau  = [np.std(ts[lag:] - ts[:-lag]) for lag in lags]
+
+    # 过滤掉 std=0 的情况
+    valid = [(l, t) for l, t in zip(lags, tau) if t > 0]
+    if len(valid) < 3:
+        return 0.5
+
+    log_lags = np.log([v[0] for v in valid])
+    log_tau  = np.log([v[1] for v in valid])
+    h = float(np.polyfit(log_lags, log_tau, 1)[0])
+    return np.clip(h, 0.0, 1.0)
+
+
+def detect_regime(spread: pd.Series, hurst_window: int = 60) -> str:
+    """
+    用最近 hurst_window 根K线的价差序列判断当前市场状态。
+
+    返回：
+      'mean_reversion' → 震荡，用高抛低吸
+      'trend'          → 趋势，用追涨杀跌
+      'uncertain'      → 不确定，空仓观望
+    """
+    recent = spread.iloc[-hurst_window:]
+    h = calc_hurst(recent)
+
+    if h < 0.45:
+        return "mean_reversion"
+    elif h > 0.55:
+        return "trend"
+    else:
+        return "uncertain"
+
+
 # ============================================================
 # 主策略
 # ============================================================
@@ -210,35 +263,58 @@ def run_strategy(
         if np.isnan(z):
             continue   # 数据积累不足，跳过
 
+        # ---- 市场状态识别（Hurst 指数）----
+        regime = detect_regime(gfex_spread, hurst_window=60)
+
         # ---- 当前净持仓 ----
         pt_net = pt_pos.pos_long - pt_pos.pos_short
-        pd_net = pd_pos.pos_long - pd_pos.pos_short
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        h_val = calc_hurst(gfex_spread.iloc[-60:])
         print(
-            f"[{ts}] GFEX价差={gfex_spread.iloc[-1]:.2f} CNY/g  "
-            f"参考价差={lme_spread_cny:.2f}  偏离Z={z:.2f}  "
-            f"PT持仓={pt_net}手  PD持仓={pd_net}手"
+            f"[{ts}] 价差={gfex_spread.iloc[-1]:.2f}  Z={z:.2f}  "
+            f"Hurst={h_val:.2f}  状态={regime}  PT持仓={pt_net}手"
         )
 
-        # ---- 交易信号 ----
-        if z > Z_ENTRY and pt_net == 0:
-            # 广期所铂钯价差偏高于参考 → 做空价差：卖PT + 买PD
-            print(f"  ▼ 做空价差：目标 PT={-MAX_LOTS_PT}手 / PD=+{MAX_LOTS_PT * HEDGE_RATIO}手")
-            pt_task.set_target_volume(-MAX_LOTS_PT)
-            pd_task.set_target_volume(MAX_LOTS_PT * HEDGE_RATIO)
-
-        elif z < -Z_ENTRY and pt_net == 0:
-            # 广期所铂钯价差偏低于参考 → 做多价差：买PT + 卖PD
-            print(f"  ▲ 做多价差：目标 PT=+{MAX_LOTS_PT}手 / PD={-MAX_LOTS_PT * HEDGE_RATIO}手")
-            pt_task.set_target_volume(MAX_LOTS_PT)
-            pd_task.set_target_volume(-MAX_LOTS_PT * HEDGE_RATIO)
-
-        elif abs(z) < Z_EXIT and pt_net != 0:
-            # 价差已回归均值区间，平仓
-            print("  ◆ 价差回归，平仓")
+        # ---- 状态切换：先强制平掉不符合当前状态的仓位 ----
+        if regime == "uncertain" and pt_net != 0:
+            print("  ■ 状态不明，平仓观望")
             pt_task.set_target_volume(0)
             pd_task.set_target_volume(0)
+
+        # ---- 均值回归模式：高抛低吸 ----
+        elif regime == "mean_reversion":
+            if z > Z_ENTRY and pt_net == 0:
+                print(f"  ▼ [震荡] 做空价差：卖PT买PD")
+                pt_task.set_target_volume(-MAX_LOTS_PT)
+                pd_task.set_target_volume(MAX_LOTS_PT * HEDGE_RATIO)
+
+            elif z < -Z_ENTRY and pt_net == 0:
+                print(f"  ▲ [震荡] 做多价差：买PT卖PD")
+                pt_task.set_target_volume(MAX_LOTS_PT)
+                pd_task.set_target_volume(-MAX_LOTS_PT * HEDGE_RATIO)
+
+            elif abs(z) < Z_EXIT and pt_net != 0:
+                print("  ◆ [震荡] 价差回归，平仓")
+                pt_task.set_target_volume(0)
+                pd_task.set_target_volume(0)
+
+        # ---- 趋势跟踪模式：追涨杀跌 ----
+        elif regime == "trend":
+            # 趋势信号：价差在均值之上做多，之下做空
+            spread_now  = gfex_spread.iloc[-1]
+            spread_mean = gfex_spread.rolling(LOOKBACK).mean().iloc[-1]
+            above_mean  = spread_now > spread_mean
+
+            if above_mean and pt_net <= 0:
+                print(f"  ▲ [趋势] 价差上行，做多价差：买PT卖PD")
+                pt_task.set_target_volume(MAX_LOTS_PT)
+                pd_task.set_target_volume(-MAX_LOTS_PT * HEDGE_RATIO)
+
+            elif not above_mean and pt_net >= 0:
+                print(f"  ▼ [趋势] 价差下行，做空价差：卖PT买PD")
+                pt_task.set_target_volume(-MAX_LOTS_PT)
+                pd_task.set_target_volume(MAX_LOTS_PT * HEDGE_RATIO)
 
 
 # ============================================================
