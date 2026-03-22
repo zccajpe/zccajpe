@@ -22,10 +22,16 @@ LME 数据说明：
   "GFEX 价差自身滚动均值回归"模式，仍然可以运行和回测。
 """
 
+import csv
+import itertools
 import numpy as np
 import pandas as pd
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from contextlib import closing
+from pathlib import Path
+
+from statsmodels.tsa.stattools import coint
 
 from tqsdk import TqApi, TqAuth, TqSim, TqBacktest, TargetPosTask
 from tqsdk.tools import DataDownloader
@@ -233,6 +239,246 @@ def calc_margin_usage(pt_price: float, pd_price: float, pos_level: int) -> dict:
 
 
 # ============================================================
+# 涨跌停保护
+# ============================================================
+
+def check_limit_protection(direction: int, pt_quote, pd_quote) -> tuple[bool, str]:
+    """
+    开仓前检查涨跌停，避免单腿无法成交导致裸露风险。
+
+    direction = +1：买PT 卖PD
+    direction = -1：卖PT 买PD
+
+    返回 (True, "") 表示可以开仓；(False, 原因) 表示受限。
+    """
+    pt_up   = pt_quote.last_price >= pt_quote.upper_limit
+    pt_down = pt_quote.last_price <= pt_quote.lower_limit
+    pd_up   = pd_quote.last_price >= pd_quote.upper_limit
+    pd_down = pd_quote.last_price <= pd_quote.lower_limit
+
+    if direction == +1:
+        if pt_up:   return False, "PT涨停，无法买入"
+        if pd_down: return False, "PD跌停，无法卖出"
+    else:
+        if pt_down: return False, "PT跌停，无法卖出"
+        if pd_up:   return False, "PD涨停，无法买入"
+
+    return True, ""
+
+
+def check_close_protection(pos_direction: int, pt_quote, pd_quote) -> tuple[bool, str]:
+    """
+    平仓前检查是否被涨跌停锁死。
+    平仓方向与开仓方向相反，逻辑镜像。
+    """
+    return check_limit_protection(-pos_direction, pt_quote, pd_quote)
+
+
+# ============================================================
+# 绩效实时记录
+# ============================================================
+
+@dataclass
+class TradeRecord:
+    trade_id:     int
+    direction:    str       # "多价差" / "空价差"
+    entry_time:   str
+    entry_z:      float
+    entry_spread: float
+    entry_level:  int       # 1=单层 2=加仓后
+    exit_time:    str  = ""
+    exit_z:       float = 0.0
+    exit_spread:  float = 0.0
+    exit_reason:  str  = ""  # "profit" / "stop_loss" / "regime" / "time_stop"
+    lots:         int  = 0
+    pnl:          float = 0.0
+
+
+class PerformanceTracker:
+    """
+    实时记录每笔交易，计算滚动绩效指标，保存到 CSV。
+    """
+    LOG_FILE = Path("trade_log.csv")
+    FIELDS   = list(TradeRecord.__dataclass_fields__.keys())
+
+    def __init__(self):
+        self.trades: list[TradeRecord] = []
+        self._next_id = 1
+        # 若文件不存在则写表头
+        if not self.LOG_FILE.exists():
+            with open(self.LOG_FILE, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+
+    def open_trade(self, direction: int, z: float, spread: float, level: int, lots: int) -> TradeRecord:
+        rec = TradeRecord(
+            trade_id     = self._next_id,
+            direction    = "多价差" if direction == +1 else "空价差",
+            entry_time   = datetime.now().strftime("%Y-%m-%d %H:%M"),
+            entry_z      = round(z, 3),
+            entry_spread = round(spread, 3),
+            entry_level  = level,
+            lots         = lots,
+        )
+        self.trades.append(rec)
+        self._next_id += 1
+        return rec
+
+    def close_trade(self, rec: TradeRecord, z: float, spread: float,
+                    reason: str, pos_direction: int):
+        rec.exit_time   = datetime.now().strftime("%Y-%m-%d %H:%M")
+        rec.exit_z      = round(z, 3)
+        rec.exit_spread = round(spread, 3)
+        rec.exit_reason = reason
+        # P&L = 方向 × 价差变化 × 手数 × 合约乘数
+        rec.pnl = round(
+            pos_direction * (rec.exit_spread - rec.entry_spread) * rec.lots * PT_UNIT, 2
+        )
+        # 追加写入 CSV
+        with open(self.LOG_FILE, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=self.FIELDS).writerow(rec.__dict__)
+        self._print_summary()
+
+    def _print_summary(self):
+        closed = [t for t in self.trades if t.exit_time]
+        if not closed:
+            return
+        pnls     = [t.pnl for t in closed]
+        wins     = [p for p in pnls if p > 0]
+        n        = len(closed)
+        total    = sum(pnls)
+        win_rate = len(wins) / n * 100
+        print(
+            f"  📊 绩效 | 累计{n}笔  总盈亏{total/10000:.2f}万  "
+            f"胜率{win_rate:.0f}%  "
+            f"最近:{'+' if pnls[-1]>=0 else ''}{pnls[-1]/10000:.2f}万({closed[-1].exit_reason})"
+        )
+
+
+# ============================================================
+# 协整检验
+# ============================================================
+
+def run_cointegration_test(
+    pt_prices: pd.Series,
+    pd_prices: pd.Series,
+    significance: float = 0.05,
+) -> tuple[bool, float]:
+    """
+    Engle-Granger 协整检验：检验 PT 和 PD 价格序列是否存在稳定的
+    长期均衡关系（即价差不会无限漂移）。
+
+    返回 (is_cointegrated, p_value)
+      p_value < 0.05 → 协整成立，策略统计基础有效
+      p_value > 0.05 → 协整不成立，建议暂停策略
+    """
+    if len(pt_prices) < 60:
+        return True, 0.0   # 数据不足，默认放行
+
+    _, pvalue, _ = coint(pt_prices.values, pd_prices.values)
+    is_coint = pvalue < significance
+    status   = "✅ 协整成立" if is_coint else "❌ 协整不成立"
+    print(f"  🔬 协整检验 | p={pvalue:.4f}  {status}")
+    return is_coint, float(pvalue)
+
+
+# ============================================================
+# 参数定期优化
+# ============================================================
+
+PARAM_GRID = {
+    "lookback": [60, 90, 120, 180],
+    "z_entry":  [1.5, 2.0, 2.5],
+    "z_exit":   [0.3, 0.5, 0.8],
+}
+
+
+def optimize_params(spread: pd.Series) -> dict:
+    """
+    在最近的价差数据上跑网格搜索，找出 Sharpe 最高的参数组合，
+    动态更新全局策略参数。
+
+    每隔 PARAM_OPT_INTERVAL_HOURS 小时自动调用一次。
+    """
+    best_sharpe = -np.inf
+    best_params = {"lookback": 120, "z_entry": 2.0, "z_exit": 0.5}
+
+    spread_vals = spread.dropna().values
+    if len(spread_vals) < 200:
+        print("  ⚙️  参数优化：数据不足200根，跳过")
+        return best_params
+
+    for lookback, z_entry, z_exit in itertools.product(
+        PARAM_GRID["lookback"], PARAM_GRID["z_entry"], PARAM_GRID["z_exit"]
+    ):
+        sharpe = _quick_backtest_sharpe(spread_vals, lookback, z_entry, z_exit)
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_params = {"lookback": lookback, "z_entry": z_entry, "z_exit": z_exit}
+
+    print(
+        f"  ⚙️  参数优化完成 | "
+        f"lookback={best_params['lookback']}  "
+        f"z_entry={best_params['z_entry']}  "
+        f"z_exit={best_params['z_exit']}  "
+        f"Sharpe={best_sharpe:.2f}"
+    )
+    return best_params
+
+
+def _quick_backtest_sharpe(
+    spread: np.ndarray,
+    lookback: int,
+    z_entry: float,
+    z_exit: float,
+) -> float:
+    """轻量回测：返回该参数组合在价差序列上的 Sharpe 比率。"""
+    n       = len(spread)
+    balance = 1.0          # 归一化净值
+    bal_series = []
+    position   = 0         # +1 / -1 / 0
+    cost       = 0.001     # 每次开平仓单边摩擦（归一化）
+
+    roll_mean = pd.Series(spread).rolling(lookback, min_periods=lookback//2).mean().values
+    roll_std  = pd.Series(spread).rolling(lookback, min_periods=lookback//2).std().values
+
+    for i in range(n):
+        if np.isnan(roll_mean[i]) or roll_std[i] == 0:
+            continue
+        z = (spread[i] - roll_mean[i]) / roll_std[i]
+
+        # 平仓
+        if position != 0 and abs(z) < z_exit:
+            balance += position * (spread[i] - entry_price) - cost
+            position = 0
+
+        # 止损
+        elif position != 0:
+            adverse = position * (entry_price - spread[i])
+            if adverse > 2 * z_entry * roll_std[i]:
+                balance += position * (spread[i] - entry_price) - cost
+                position = 0
+
+        # 开仓
+        if position == 0:
+            if z > z_entry:
+                position, entry_price = -1, spread[i]
+                balance -= cost
+            elif z < -z_entry:
+                position, entry_price = +1, spread[i]
+                balance -= cost
+
+        bal_series.append(balance)
+
+    if len(bal_series) < 10:
+        return -np.inf
+    rets = np.diff(bal_series)
+    return float(rets.mean() / rets.std() * np.sqrt(252 * 6)) if rets.std() > 0 else -np.inf
+
+
+PARAM_OPT_INTERVAL_HOURS = 7 * 24   # 每7天重新优化一次
+
+
+# ============================================================
 # 主策略
 # ============================================================
 
@@ -279,10 +525,21 @@ def run_strategy(
     account  = api.get_account()
 
     # ---- 持仓状态追踪 ----
-    # direction: +1=多价差(买PT卖PD)  -1=空价差(卖PT买PD)  0=空仓
-    # level:     0=空仓  1=第一层  2=已加仓
     pos_direction = 0
     pos_level     = 0
+
+    # ---- 绩效追踪 ----
+    tracker       = PerformanceTracker()
+    current_trade: TradeRecord | None = None
+
+    # ---- 动态参数（由优化器更新）----
+    dyn_lookback = LOOKBACK
+    dyn_z_entry  = Z_ENTRY_1
+    dyn_z_exit   = Z_EXIT
+
+    # ---- 定时任务时间戳 ----
+    last_coint_check = datetime.min
+    last_param_opt   = datetime.min
 
     print("策略启动，等待数据初始化...")
 
@@ -297,6 +554,26 @@ def run_strategy(
         if not new_bar:
             continue
 
+        # ---- 定时：协整检验（每24小时）----
+        now = datetime.now()
+        if (now - last_coint_check).total_seconds() > 24 * 3600:
+            is_coint, _ = run_cointegration_test(
+                pt_klines["close"], pd_klines["close"]
+            )
+            last_coint_check = now
+            if not is_coint and pos_level == 0:
+                print("  ⚠️  协整检验未通过，暂停开新仓")
+                continue
+
+        # ---- 定时：参数优化（每7天）----
+        if (now - last_param_opt).total_seconds() > PARAM_OPT_INTERVAL_HOURS * 3600:
+            spread_tmp = pt_klines["close"] - pd_klines["close"]
+            best       = optimize_params(spread_tmp)
+            dyn_lookback = best["lookback"]
+            dyn_z_entry  = best["z_entry"]
+            dyn_z_exit   = best["z_exit"]
+            last_param_opt = now
+
         # ---- 计算 GFEX 价差 ----
         gfex_spread = calc_gfex_spread(pt_klines, pd_klines)
 
@@ -310,9 +587,9 @@ def run_strategy(
         if lme_spread_cny is None or np.isnan(lme_spread_cny):
             continue
 
-        # ---- 计算偏离度与 Z-score ----
+        # ---- 计算偏离度与 Z-score（使用动态参数）----
         divergence    = calc_divergence(gfex_spread, lme_spread_cny)
-        zscore_series = calc_zscore(divergence, LOOKBACK)
+        zscore_series = calc_zscore(divergence, dyn_lookback)
         z = zscore_series.iloc[-1]
 
         if np.isnan(z):
@@ -338,78 +615,80 @@ def run_strategy(
             f"  保证金占用：{mm['margin_万']}万 ({mm['margin_pct']}%){margin_tip}"
         )
 
-        # ---- 辅助：根据方向获取当前 Z 的"不利方向"强度 ----
-        # 做空价差时 z 越大越不利；做多价差时 z 越小（越负）越不利
-        adverse_z = z * pos_direction * -1 if pos_direction != 0 else 0
+        # ---- 辅助 ----
+        adverse_z   = z * pos_direction * -1 if pos_direction != 0 else 0
+        spread_now  = gfex_spread.iloc[-1]
 
-        # ====================================================
-        # 状态切换：Hurst 状态变化时清仓
-        # ====================================================
-        if regime == "uncertain" and pos_level > 0:
-            print("  ■ 状态不明，清仓观望")
+        def _open(direction: int, lots: int, reason: str):
+            nonlocal pos_direction, pos_level, current_trade
+            ok, msg = check_limit_protection(direction, pt_quote, pd_quote)
+            if not ok:
+                print(f"  🚫 涨跌停保护：{msg}，跳过开仓")
+                return
+            pt_task.set_target_volume(direction * lots)
+            pd_task.set_target_volume(-direction * lots * HEDGE_RATIO)
+            pos_direction = direction
+            pos_level     = 1 if pos_level == 0 else 2
+            current_trade = tracker.open_trade(direction, z, spread_now, pos_level, lots)
+            print(f"  {'▲' if direction>0 else '▼'} [{reason}] Z={z:.2f}  {lots}手")
+
+        def _close(reason: str):
+            nonlocal pos_direction, pos_level, current_trade
+            ok, msg = check_close_protection(pos_direction, pt_quote, pd_quote)
+            if not ok:
+                print(f"  🚫 涨跌停保护：{msg}，无法平仓！请手动处理")
+                return
             pt_task.set_target_volume(0)
             pd_task.set_target_volume(0)
+            if current_trade:
+                tracker.close_trade(current_trade, z, spread_now, reason, pos_direction)
+                current_trade = None
             pos_direction, pos_level = 0, 0
+            print(f"  ◆ [平仓:{reason}] Z={z:.2f}")
+
+        # ====================================================
+        # 状态切换：Hurst 不确定时清仓
+        # ====================================================
+        if regime == "uncertain" and pos_level > 0:
+            _close("regime")
 
         # ====================================================
         # 均值回归模式：分批建仓 + 止损
         # ====================================================
         elif regime == "mean_reversion":
 
-            # ---- 止损（最高优先级）----
             if pos_level > 0 and adverse_z >= Z_STOP:
-                print(f"  ✕ [止损] Z={z:.2f} 突破 {Z_STOP}，清仓止损")
-                pt_task.set_target_volume(0)
-                pd_task.set_target_volume(0)
-                pos_direction, pos_level = 0, 0
+                _close("stop_loss")
 
-            # ---- 加仓（第二层）----
             elif pos_level == 1 and adverse_z >= (Z_ENTRY_2 - Z_ENTRY_1):
-                total_lots = LOTS_LEVEL_1 * 2
-                print(f"  ➕ [加仓] Z={z:.2f} 到达第二层，累计 {total_lots} 手")
-                pt_task.set_target_volume(pos_direction * total_lots)
-                pd_task.set_target_volume(-pos_direction * total_lots * HEDGE_RATIO)
-                pos_level = 2
+                total = LOTS_LEVEL_1 + LOTS_LEVEL_2
+                _open(pos_direction, total, "加仓L2")
 
-            # ---- 正常平仓 ----
-            elif pos_level > 0 and abs(z) < Z_EXIT:
-                print(f"  ◆ [平仓] Z={z:.2f} 回归，获利了结")
-                pt_task.set_target_volume(0)
-                pd_task.set_target_volume(0)
-                pos_direction, pos_level = 0, 0
+            elif pos_level > 0 and abs(z) < dyn_z_exit:
+                _close("profit")
 
-            # ---- 第一层开仓 ----
-            elif pos_level == 0 and z > Z_ENTRY_1:
-                print(f"  ▼ [开仓L1] Z={z:.2f}，做空价差 {LOTS_LEVEL_1} 手：卖PT买PD")
-                pt_task.set_target_volume(-LOTS_LEVEL_1)
-                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
-                pos_direction, pos_level = -1, 1
+            elif pos_level == 0 and z > dyn_z_entry:
+                _open(-1, LOTS_LEVEL_1, "开仓L1 空价差")
 
-            elif pos_level == 0 and z < -Z_ENTRY_1:
-                print(f"  ▲ [开仓L1] Z={z:.2f}，做多价差 {LOTS_LEVEL_1} 手：买PT卖PD")
-                pt_task.set_target_volume(LOTS_LEVEL_1)
-                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
-                pos_direction, pos_level = +1, 1
+            elif pos_level == 0 and z < -dyn_z_entry:
+                _open(+1, LOTS_LEVEL_1, "开仓L1 多价差")
 
         # ====================================================
-        # 趋势跟踪模式：追涨杀跌（单层，不加仓）
+        # 趋势跟踪模式：追涨杀跌（单层）
         # ====================================================
         elif regime == "trend":
-            spread_now  = gfex_spread.iloc[-1]
-            spread_mean = gfex_spread.rolling(LOOKBACK).mean().iloc[-1]
+            spread_mean = gfex_spread.rolling(dyn_lookback).mean().iloc[-1]
             above_mean  = spread_now > spread_mean
 
             if above_mean and pos_direction <= 0:
-                print(f"  ▲ [趋势] 价差上行，做多价差 {LOTS_LEVEL_1} 手")
-                pt_task.set_target_volume(LOTS_LEVEL_1)
-                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
-                pos_direction, pos_level = +1, 1
+                if pos_level > 0:
+                    _close("趋势反转")
+                _open(+1, LOTS_LEVEL_1, "趋势多价差")
 
             elif not above_mean and pos_direction >= 0:
-                print(f"  ▼ [趋势] 价差下行，做空价差 {LOTS_LEVEL_1} 手")
-                pt_task.set_target_volume(-LOTS_LEVEL_1)
-                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
-                pos_direction, pos_level = -1, 1
+                if pos_level > 0:
+                    _close("趋势反转")
+                _open(-1, LOTS_LEVEL_1, "趋势空价差")
 
 
 # ============================================================
