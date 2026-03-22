@@ -53,9 +53,15 @@ TROY_OZ_TO_GRAM = 31.1035   # 1金衡盎司 = 31.1035克
 
 BAR_DURATION = 3600    # K线周期：3600秒 = 1小时
 LOOKBACK     = 120     # 滚动窗口：120根K线（约5个交易日）
-Z_ENTRY      = 2.0     # 开仓 Z-score 阈值
-Z_EXIT       = 0.5     # 平仓 Z-score 阈值
-MAX_LOTS_PT  = 1       # 每次最多开 PT 的手数（PD = MAX_LOTS_PT × HEDGE_RATIO）
+
+# 均值回归模式：分批建仓参数
+Z_ENTRY_1    = 2.0     # 第一层开仓阈值
+Z_ENTRY_2    = 3.0     # 加仓阈值（价差继续扩大时补仓）
+Z_STOP       = 4.0     # 止损阈值（加仓后仍不回归，认亏离场）
+Z_EXIT       = 0.5     # 正常平仓阈值（价差回归均值附近）
+
+LOTS_LEVEL_1 = 2       # 第一层手数（广期所铂钯最低开仓 2 手）
+LOTS_LEVEL_2 = 2       # 加仓手数（累计 = LOTS_LEVEL_1 + LOTS_LEVEL_2 = 4 手）
 
 
 # ============================================================
@@ -229,6 +235,12 @@ def run_strategy(
     pt_task = TargetPosTask(api, PT_SYMBOL, price="ACTIVE")
     pd_task = TargetPosTask(api, PD_SYMBOL, price="ACTIVE")
 
+    # ---- 持仓状态追踪 ----
+    # direction: +1=多价差(买PT卖PD)  -1=空价差(卖PT买PD)  0=空仓
+    # level:     0=空仓  1=第一层  2=已加仓
+    pos_direction = 0
+    pos_level     = 0
+
     print("策略启动，等待数据初始化...")
 
     while True:
@@ -276,45 +288,78 @@ def run_strategy(
             f"Hurst={h_val:.2f}  状态={regime}  PT持仓={pt_net}手"
         )
 
-        # ---- 状态切换：先强制平掉不符合当前状态的仓位 ----
-        if regime == "uncertain" and pt_net != 0:
-            print("  ■ 状态不明，平仓观望")
+        # ---- 辅助：根据方向获取当前 Z 的"不利方向"强度 ----
+        # 做空价差时 z 越大越不利；做多价差时 z 越小（越负）越不利
+        adverse_z = z * pos_direction * -1 if pos_direction != 0 else 0
+
+        # ====================================================
+        # 状态切换：Hurst 状态变化时清仓
+        # ====================================================
+        if regime == "uncertain" and pos_level > 0:
+            print("  ■ 状态不明，清仓观望")
             pt_task.set_target_volume(0)
             pd_task.set_target_volume(0)
+            pos_direction, pos_level = 0, 0
 
-        # ---- 均值回归模式：高抛低吸 ----
+        # ====================================================
+        # 均值回归模式：分批建仓 + 止损
+        # ====================================================
         elif regime == "mean_reversion":
-            if z > Z_ENTRY and pt_net == 0:
-                print(f"  ▼ [震荡] 做空价差：卖PT买PD")
-                pt_task.set_target_volume(-MAX_LOTS_PT)
-                pd_task.set_target_volume(MAX_LOTS_PT * HEDGE_RATIO)
 
-            elif z < -Z_ENTRY and pt_net == 0:
-                print(f"  ▲ [震荡] 做多价差：买PT卖PD")
-                pt_task.set_target_volume(MAX_LOTS_PT)
-                pd_task.set_target_volume(-MAX_LOTS_PT * HEDGE_RATIO)
-
-            elif abs(z) < Z_EXIT and pt_net != 0:
-                print("  ◆ [震荡] 价差回归，平仓")
+            # ---- 止损（最高优先级）----
+            if pos_level > 0 and adverse_z >= Z_STOP:
+                print(f"  ✕ [止损] Z={z:.2f} 突破 {Z_STOP}，清仓止损")
                 pt_task.set_target_volume(0)
                 pd_task.set_target_volume(0)
+                pos_direction, pos_level = 0, 0
 
-        # ---- 趋势跟踪模式：追涨杀跌 ----
+            # ---- 加仓（第二层）----
+            elif pos_level == 1 and adverse_z >= (Z_ENTRY_2 - Z_ENTRY_1):
+                total_lots = LOTS_LEVEL_1 + LOTS_LEVEL_2
+                print(f"  ➕ [加仓] Z={z:.2f} 到达第二层，累计 {total_lots} 手")
+                pt_task.set_target_volume(pos_direction * total_lots)
+                pd_task.set_target_volume(-pos_direction * total_lots * HEDGE_RATIO)
+                pos_level = 2
+
+            # ---- 正常平仓 ----
+            elif pos_level > 0 and abs(z) < Z_EXIT:
+                print(f"  ◆ [平仓] Z={z:.2f} 回归，获利了结")
+                pt_task.set_target_volume(0)
+                pd_task.set_target_volume(0)
+                pos_direction, pos_level = 0, 0
+
+            # ---- 第一层开仓 ----
+            elif pos_level == 0 and z > Z_ENTRY_1:
+                print(f"  ▼ [开仓L1] Z={z:.2f}，做空价差：卖PT买PD")
+                pt_task.set_target_volume(-LOTS_LEVEL_1)
+                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
+                pos_direction, pos_level = -1, 1
+
+            elif pos_level == 0 and z < -Z_ENTRY_1:
+                print(f"  ▲ [开仓L1] Z={z:.2f}，做多价差：买PT卖PD")
+                pt_task.set_target_volume(LOTS_LEVEL_1)
+                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
+                pos_direction, pos_level = +1, 1
+
+        # ====================================================
+        # 趋势跟踪模式：追涨杀跌（单层，不加仓）
+        # ====================================================
         elif regime == "trend":
-            # 趋势信号：价差在均值之上做多，之下做空
             spread_now  = gfex_spread.iloc[-1]
             spread_mean = gfex_spread.rolling(LOOKBACK).mean().iloc[-1]
             above_mean  = spread_now > spread_mean
 
-            if above_mean and pt_net <= 0:
-                print(f"  ▲ [趋势] 价差上行，做多价差：买PT卖PD")
-                pt_task.set_target_volume(MAX_LOTS_PT)
-                pd_task.set_target_volume(-MAX_LOTS_PT * HEDGE_RATIO)
+            if above_mean and pos_direction <= 0:
+                print(f"  ▲ [趋势] 价差上行，做多价差")
+                pt_task.set_target_volume(LOTS_LEVEL_1)
+                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
+                pos_direction, pos_level = +1, 1
 
-            elif not above_mean and pt_net >= 0:
-                print(f"  ▼ [趋势] 价差下行，做空价差：卖PT买PD")
-                pt_task.set_target_volume(-MAX_LOTS_PT)
-                pd_task.set_target_volume(MAX_LOTS_PT * HEDGE_RATIO)
+            elif not above_mean and pos_direction >= 0:
+                print(f"  ▼ [趋势] 价差下行，做空价差")
+                pt_task.set_target_volume(-LOTS_LEVEL_1)
+                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
+                pos_direction, pos_level = -1, 1
 
 
 # ============================================================
