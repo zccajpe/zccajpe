@@ -12,9 +12,9 @@
   5. Z-score 回归至 ±0.5σ 内时平仓
 
 合约规格（广期所，2024年11月上市）：
-  PT 铂：500克/手，报价单位 CNY/克
-  PD 钯：100克/手，报价单位 CNY/克
-  克重对冲比：1手PT 对冲 5手PD（保持克重中性）
+  PT 铂：1000克/手，报价单位 CNY/克
+  PD 钯：1000克/手，报价单位 CNY/克
+  克重对冲比：1手PT 对冲 1手PD（两者合约乘数相同）
 
 LME 数据说明：
   TqSdk 不直接提供 LME 数据，需要外部接入（彭博/Wind/CSV等）。
@@ -38,11 +38,11 @@ from tqsdk.tools import DataDownloader
 PT_SYMBOL = "KQ.m@GFEX.pt"   # 铂主连
 PD_SYMBOL = "KQ.m@GFEX.pd"   # 钯主连
 
-PT_UNIT = 500    # 铂：500克/手
-PD_UNIT = 100    # 钯：100克/手
+PT_UNIT = 1000   # 铂：1000克/手
+PD_UNIT = 1000   # 钯：1000克/手
 
-# 克重中性对冲比：1手PT = 5手PD
-HEDGE_RATIO = PT_UNIT // PD_UNIT   # 5
+# 克重中性对冲比：1手PT = 1手PD（两者合约乘数相同）
+HEDGE_RATIO = PT_UNIT // PD_UNIT   # 1
 
 TROY_OZ_TO_GRAM = 31.1035   # 1金衡盎司 = 31.1035克
 
