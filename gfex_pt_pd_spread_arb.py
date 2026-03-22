@@ -60,8 +60,16 @@ Z_ENTRY_2    = 3.0     # 加仓阈值（价差继续扩大时补仓）
 Z_STOP       = 4.0     # 止损阈值（加仓后仍不回归，认亏离场）
 Z_EXIT       = 0.5     # 正常平仓阈值（价差回归均值附近）
 
-LOTS_LEVEL_1 = 2       # 第一层手数（广期所铂钯最低开仓 2 手）
-LOTS_LEVEL_2 = 2       # 加仓手数（累计 = LOTS_LEVEL_1 + LOTS_LEVEL_2 = 4 手）
+MIN_LOTS     = 2       # 广期所铂钯最低开仓手数
+
+# ============================================================
+# 资金管理参数
+# ============================================================
+
+MARGIN_RATIO     = 0.06    # 广期所保证金比例 6%
+MARGIN_BUFFER    = 2.0     # 保证金缓冲倍数：实际占用不超过计算值的2倍留余量
+MAX_RISK_PCT     = 0.02    # 单笔套利最大亏损占账户净值的比例（2%）
+MAX_MARGIN_PCT   = 0.30    # 本策略保证金占用上限（账户净值的30%）
 
 
 # ============================================================
@@ -195,6 +203,67 @@ def detect_regime(spread: pd.Series, hurst_window: int = 60) -> str:
 
 
 # ============================================================
+# 资金管理
+# ============================================================
+
+def calc_position_size(
+    account_balance: float,
+    pt_price: float,
+    pd_price: float,
+    spread_std: float,
+) -> tuple[int, dict]:
+    """
+    动态计算每层允许开的手数，同时输出资金诊断信息。
+
+    逻辑：
+      1. 风险上限法：最大亏损 = balance × MAX_RISK_PCT
+         最坏亏损发生在 Z 从入场(2σ)走到止损(4σ)，即价差再移动 2σ
+         → max_lots_by_risk = max_loss / (2 × spread_std × PT_UNIT)
+
+      2. 保证金上限法：Level2 总保证金 ≤ balance × MAX_MARGIN_PCT
+         level2 = lots_L1 + lots_L2 = 2 × lots_L1
+         → max_lots_by_margin = (balance × MAX_MARGIN_PCT)
+                                 / (2 × (pt_price + pd_price) × PT_UNIT × MARGIN_RATIO × MARGIN_BUFFER)
+
+      3. 取两者较小值，再向下取整到 MIN_LOTS 的整数倍。
+
+    返回：(每层手数, 诊断字典)
+    """
+    # --- 风险上限：单笔最大亏损不超过账户的 MAX_RISK_PCT ---
+    max_loss      = account_balance * MAX_RISK_PCT
+    # Level2共 2×lots 手，止损时价差移动约 2σ（从Z=2到Z=4）
+    # 亏损 = 手数 × 2σ × 合约乘数（PT和PD方向相反，只算PT侧）
+    # 实际上PT和PD各贡献一半，总亏损 = lots × 2 × spread_std × PT_UNIT
+    max_lots_risk = max_loss / (2 * spread_std * PT_UNIT) / 2
+    # ÷2 是因为Level2 = 2×lots，我们要算的是单层lots
+
+    # --- 保证金上限：Level2 全开时不超过账户的 MAX_MARGIN_PCT ---
+    margin_per_lot = (pt_price + pd_price) * PT_UNIT * MARGIN_RATIO
+    max_lots_margin = (account_balance * MAX_MARGIN_PCT) / (
+        2 * margin_per_lot * MARGIN_BUFFER
+    )
+
+    # --- 取最小值，向下取整到 MIN_LOTS 的整数倍 ---
+    raw_lots = min(max_lots_risk, max_lots_margin)
+    lots     = max(MIN_LOTS, int(raw_lots // MIN_LOTS) * MIN_LOTS)
+
+    # --- 诊断信息 ---
+    margin_l1 = lots       * margin_per_lot
+    margin_l2 = lots * 2   * margin_per_lot
+    info = {
+        "lots_per_level":    lots,
+        "max_lots_by_risk":  round(max_lots_risk, 1),
+        "max_lots_by_margin": round(max_lots_margin, 1),
+        "margin_L1_万":      round(margin_l1 / 10_000, 2),
+        "margin_L2_万":      round(margin_l2 / 10_000, 2),
+        "margin_L2_pct":     round(margin_l2 / account_balance * 100, 2),
+        "max_loss_L2_万":    round(lots * 2 * spread_std * PT_UNIT * 2 / 10_000, 2),
+        "max_loss_L2_pct":   round(lots * 2 * spread_std * PT_UNIT * 2 / account_balance * 100, 2),
+    }
+    return lots, info
+
+
+# ============================================================
 # 主策略
 # ============================================================
 
@@ -235,11 +304,17 @@ def run_strategy(
     pt_task = TargetPosTask(api, PT_SYMBOL, price="ACTIVE")
     pd_task = TargetPosTask(api, PD_SYMBOL, price="ACTIVE")
 
+    # ---- 行情订阅 ----
+    pt_quote = api.get_quote(PT_SYMBOL)
+    pd_quote = api.get_quote(PD_SYMBOL)
+    account  = api.get_account()
+
     # ---- 持仓状态追踪 ----
     # direction: +1=多价差(买PT卖PD)  -1=空价差(卖PT买PD)  0=空仓
     # level:     0=空仓  1=第一层  2=已加仓
     pos_direction = 0
     pos_level     = 0
+    lots_l1       = MIN_LOTS   # 每次开仓前动态计算后更新
 
     print("策略启动，等待数据初始化...")
 
@@ -288,6 +363,21 @@ def run_strategy(
             f"Hurst={h_val:.2f}  状态={regime}  PT持仓={pt_net}手"
         )
 
+        # ---- 资金管理：每根K线重新计算允许手数 ----
+        spread_std = gfex_spread.rolling(LOOKBACK).std().iloc[-1]
+        if not np.isnan(spread_std) and spread_std > 0 and pos_level == 0:
+            lots_l1, mm_info = calc_position_size(
+                account_balance=account.balance,
+                pt_price=pt_quote.last_price,
+                pd_price=pd_quote.last_price,
+                spread_std=spread_std,
+            )
+            print(
+                f"  💰 资金诊断 | 每层{lots_l1}手  "
+                f"L2保证金{mm_info['margin_L2_万']}万({mm_info['margin_L2_pct']}%)  "
+                f"最坏亏损{mm_info['max_loss_L2_万']}万({mm_info['max_loss_L2_pct']}%)"
+            )
+
         # ---- 辅助：根据方向获取当前 Z 的"不利方向"强度 ----
         # 做空价差时 z 越大越不利；做多价差时 z 越小（越负）越不利
         adverse_z = z * pos_direction * -1 if pos_direction != 0 else 0
@@ -315,7 +405,7 @@ def run_strategy(
 
             # ---- 加仓（第二层）----
             elif pos_level == 1 and adverse_z >= (Z_ENTRY_2 - Z_ENTRY_1):
-                total_lots = LOTS_LEVEL_1 + LOTS_LEVEL_2
+                total_lots = lots_l1 * 2
                 print(f"  ➕ [加仓] Z={z:.2f} 到达第二层，累计 {total_lots} 手")
                 pt_task.set_target_volume(pos_direction * total_lots)
                 pd_task.set_target_volume(-pos_direction * total_lots * HEDGE_RATIO)
@@ -330,15 +420,15 @@ def run_strategy(
 
             # ---- 第一层开仓 ----
             elif pos_level == 0 and z > Z_ENTRY_1:
-                print(f"  ▼ [开仓L1] Z={z:.2f}，做空价差：卖PT买PD")
-                pt_task.set_target_volume(-LOTS_LEVEL_1)
-                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
+                print(f"  ▼ [开仓L1] Z={z:.2f}，做空价差 {lots_l1} 手：卖PT买PD")
+                pt_task.set_target_volume(-lots_l1)
+                pd_task.set_target_volume(lots_l1 * HEDGE_RATIO)
                 pos_direction, pos_level = -1, 1
 
             elif pos_level == 0 and z < -Z_ENTRY_1:
-                print(f"  ▲ [开仓L1] Z={z:.2f}，做多价差：买PT卖PD")
-                pt_task.set_target_volume(LOTS_LEVEL_1)
-                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
+                print(f"  ▲ [开仓L1] Z={z:.2f}，做多价差 {lots_l1} 手：买PT卖PD")
+                pt_task.set_target_volume(lots_l1)
+                pd_task.set_target_volume(-lots_l1 * HEDGE_RATIO)
                 pos_direction, pos_level = +1, 1
 
         # ====================================================
@@ -350,15 +440,15 @@ def run_strategy(
             above_mean  = spread_now > spread_mean
 
             if above_mean and pos_direction <= 0:
-                print(f"  ▲ [趋势] 价差上行，做多价差")
-                pt_task.set_target_volume(LOTS_LEVEL_1)
-                pd_task.set_target_volume(-LOTS_LEVEL_1 * HEDGE_RATIO)
+                print(f"  ▲ [趋势] 价差上行，做多价差 {lots_l1} 手")
+                pt_task.set_target_volume(lots_l1)
+                pd_task.set_target_volume(-lots_l1 * HEDGE_RATIO)
                 pos_direction, pos_level = +1, 1
 
             elif not above_mean and pos_direction >= 0:
-                print(f"  ▼ [趋势] 价差下行，做空价差")
-                pt_task.set_target_volume(-LOTS_LEVEL_1)
-                pd_task.set_target_volume(LOTS_LEVEL_1 * HEDGE_RATIO)
+                print(f"  ▼ [趋势] 价差下行，做空价差 {lots_l1} 手")
+                pt_task.set_target_volume(-lots_l1)
+                pd_task.set_target_volume(lots_l1 * HEDGE_RATIO)
                 pos_direction, pos_level = -1, 1
 
 
